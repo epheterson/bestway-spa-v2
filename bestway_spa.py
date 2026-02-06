@@ -31,9 +31,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import random
 import secrets
-import string
 import sys
 import time
 from pathlib import Path
@@ -61,11 +59,24 @@ DEFAULT_CONFIG = Path(__file__).parent / ".spa_config.json"
 # Delay before read-back verification after commands (seconds)
 READBACK_DELAY = 2.5
 
+# Temperature limits (Celsius). The spa hardware enforces these too,
+# but catching them client-side gives a better error message.
+TEMP_MIN_C = 20
+TEMP_MAX_C = 40
+TEMP_MIN_F = 68
+TEMP_MAX_F = 104
+
 
 # ── HTTP Layer ───────────────────────────────────────────────────────────────
 
 class BestwayAPI:
-    """Low-level HTTP client for the Bestway SmartHub cloud API."""
+    """Low-level HTTP client for the Bestway SmartHub cloud API.
+
+    NOTE: SSL verification is disabled (verify=False) because the Bestway API
+    servers use certificates that fail validation in some environments. The API
+    traffic is still encrypted via TLS; we just skip certificate chain verification.
+    This matches the behavior of the official Android app (okhttp with relaxed SSL).
+    """
 
     def __init__(self, host: str):
         self.host = host
@@ -73,31 +84,18 @@ class BestwayAPI:
 
     def _sign(self) -> tuple[str, str, str]:
         """Generate nonce, timestamp, and MD5 signature for request auth."""
-        nonce = "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
+        nonce = secrets.token_hex(16)
         ts = str(int(time.time()))
         sign = hashlib.md5(
             (APPID + APPSECRET + nonce + ts).encode()
         ).hexdigest().upper()
         return nonce, ts, sign
 
-    def _headers(self, token: str | None = None) -> dict[str, str]:
-        nonce, ts, sign = self._sign()
-        return {
-            "pushtype": "fcm",
-            "appid": APPID,
-            "nonce": nonce,
-            "ts": ts,
-            "accept-language": "en",
-            "sign": sign,
-            "Authorization": f"token {token}" if token else "token",
-            "Host": self.host,
-            "Connection": "Keep-Alive",
-            "User-Agent": "okhttp/4.9.0",
-            "Content-Type": "application/json; charset=UTF-8",
-        }
+    def _headers(self, token: str | None = None) -> tuple[dict[str, str], str]:
+        """Build signed headers. Returns (headers, sign).
 
-    def _headers_with_sign(self, token: str | None = None) -> tuple[dict[str, str], str]:
-        """Return (headers, sign) — sign needed for AES encryption."""
+        Sign is needed for AES encryption of v2 commands.
+        """
         nonce, ts, sign = self._sign()
         headers = {
             "pushtype": "fcm",
@@ -114,22 +112,23 @@ class BestwayAPI:
         }
         return headers, sign
 
-    def post(self, path: str, payload: dict, token: str | None = None) -> dict:
-        headers = self._headers(token)
-        resp = requests.post(
-            f"{self.base_url}{path}", headers=headers, json=payload,
-            verify=False, timeout=15,
-        )
-        return resp.json()
+    @staticmethod
+    def _parse_response(resp: requests.Response) -> dict:
+        """Parse JSON response, raising a clear error on non-JSON responses."""
+        try:
+            return resp.json()
+        except (ValueError, requests.exceptions.JSONDecodeError):
+            raise RuntimeError(
+                f"API returned non-JSON (HTTP {resp.status_code}): {resp.text[:200]}"
+            )
 
-    def post_with_sign(self, path: str, payload: dict, token: str) -> tuple[dict, str]:
-        """POST returning (response, sign) for encryption use."""
-        headers, sign = self._headers_with_sign(token)
+    def post(self, path: str, payload: dict, token: str | None = None) -> dict:
+        headers, _ = self._headers(token)
         resp = requests.post(
             f"{self.base_url}{path}", headers=headers, json=payload,
             verify=False, timeout=15,
         )
-        return resp.json(), sign
+        return self._parse_response(resp)
 
     def post_raw(self, path: str, payload: dict, headers: dict) -> dict:
         """POST with caller-provided headers (for grant_device)."""
@@ -137,15 +136,15 @@ class BestwayAPI:
             f"{self.base_url}{path}", headers=headers, json=payload,
             verify=False, timeout=15,
         )
-        return resp.json()
+        return self._parse_response(resp)
 
     def get(self, path: str, token: str) -> dict:
-        headers = self._headers(token)
+        headers, _ = self._headers(token)
         resp = requests.get(
             f"{self.base_url}{path}", headers=headers,
             verify=False, timeout=15,
         )
-        return resp.json()
+        return self._parse_response(resp)
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -158,7 +157,12 @@ def config_path() -> Path:
 def load_config() -> dict | None:
     p = config_path()
     if p.exists():
-        return json.loads(p.read_text())
+        try:
+            return json.loads(p.read_text())
+        except json.JSONDecodeError:
+            print(f"  Config file corrupt: {p}")
+            print("  Delete it and run: bestway_spa.py setup")
+            sys.exit(1)
     return None
 
 
@@ -191,7 +195,9 @@ def authenticate(api: BestwayAPI, visitor_id: str, location: str = "GB") -> str 
     result = api.post("/api/enduser/visitor", payload)
     token = result.get("data", {}).get("token")
     if not token:
-        print(f"  Auth failed: {json.dumps(result, indent=2)}")
+        code = result.get("code", "?")
+        msg = result.get("message", "unknown error")
+        print(f"  Auth failed: code={code} — {msg}")
     return token
 
 
@@ -255,12 +261,18 @@ def discover_devices(api: BestwayAPI, token: str) -> list[dict]:
 
     devices = []
     for home in homes_resp.get("data", {}).get("list", []):
-        rooms_resp = api.get(f"/api/enduser/home/rooms?home_id={home['id']}", token)
+        home_id = home.get("id")
+        if home_id is None:
+            continue
+        rooms_resp = api.get(f"/api/enduser/home/rooms?home_id={home_id}", token)
         if rooms_resp.get("code") != 0:
             continue
         for room in rooms_resp.get("data", {}).get("list", []):
+            room_id = room.get("id")
+            if room_id is None:
+                continue
             devs_resp = api.get(
-                f"/api/enduser/home/room/devices?room_id={room['id']}", token,
+                f"/api/enduser/home/room/devices?room_id={room_id}", token,
             )
             if devs_resp.get("code") != 0:
                 continue
@@ -342,7 +354,7 @@ def send_command(
     plaintext = json.dumps(cmd, separators=(",", ":"))
 
     # Try v2 encrypted
-    headers, sign = api._headers_with_sign(token)
+    headers, sign = api._headers(token)
     encrypted = encrypt_command(sign, plaintext)
     if encrypted:
         resp = requests.post(
@@ -350,7 +362,7 @@ def send_command(
             headers=headers, json={"encrypted_data": encrypted},
             verify=False, timeout=15,
         )
-        result = resp.json()
+        result = BestwayAPI._parse_response(resp)
         if result.get("code") == 0:
             return result
 
@@ -496,7 +508,11 @@ def get_api_and_token() -> tuple[BestwayAPI, str, dict]:
         print("Missing product_id. Run: bestway_spa.py setup")
         sys.exit(1)
 
-    api = BestwayAPI(API_HOSTS[cfg.get("region", "EU")])
+    region = cfg.get("region", "EU")
+    if region not in API_HOSTS:
+        print(f"Invalid region '{region}' in config. Run: bestway_spa.py setup")
+        sys.exit(1)
+    api = BestwayAPI(API_HOSTS[region])
     token = authenticate(api, cfg["visitor_id"])
     if not token:
         print("Auth failed. Try: bestway_spa.py setup")
@@ -536,9 +552,11 @@ def main() -> None:
 
     if cmd == "debug":
         api, token, cfg = get_api_and_token()
+        vid = cfg['visitor_id']
+        did = cfg['device_id']
         print(f"Region: {cfg.get('region')}")
-        print(f"Visitor: {cfg['visitor_id']}")
-        print(f"Device: {cfg['device_id']}")
+        print(f"Visitor: {vid[:6]}...{vid[-4:]}")
+        print(f"Device: {did[:6]}...{did[-4:]}")
         print(f"Product: {cfg.get('product_id')}")
 
         print("\n--- Homes ---")
@@ -558,11 +576,24 @@ def main() -> None:
     api, token, cfg = get_api_and_token()
     did, pid = cfg["device_id"], cfg["product_id"]
 
+    def parse_temp(a: str) -> int:
+        try:
+            t = int(a)
+        except ValueError:
+            print(f"  Invalid temperature: '{a}' (must be a number)")
+            sys.exit(1)
+        # Accept both C and F ranges
+        if TEMP_MIN_C <= t <= TEMP_MAX_C or TEMP_MIN_F <= t <= TEMP_MAX_F:
+            return t
+        print(f"  Temperature {t} out of range.")
+        print(f"  Valid: {TEMP_MIN_C}-{TEMP_MAX_C}C or {TEMP_MIN_F}-{TEMP_MAX_F}F")
+        sys.exit(1)
+
     commands = {
         "heat":     ("heater_state",        lambda a: 1 if a in ("on", "1") else 0),
         "heater":   ("heater_state",        lambda a: 1 if a in ("on", "1") else 0),
-        "temp":     ("temperature_setting",  lambda a: int(a)),
-        "temperature": ("temperature_setting", lambda a: int(a)),
+        "temp":     ("temperature_setting",  parse_temp),
+        "temperature": ("temperature_setting", parse_temp),
         "filter":   ("filter_state",        lambda a: 1 if a in ("on", "1") else 0),
         "jets":     ("wave_state",          lambda a: 100 if a in ("on", "1", "high") else 0),
         "bubbles":  ("wave_state",          lambda a: 100 if a in ("on", "1", "high") else 0),
@@ -588,4 +619,17 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except requests.exceptions.ConnectionError:
+        print("  Connection failed. Check your network and try again.")
+        sys.exit(1)
+    except requests.exceptions.Timeout:
+        print("  Request timed out. The Bestway API may be slow or down.")
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"  Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n  Aborted.")
+        sys.exit(130)

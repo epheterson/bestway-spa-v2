@@ -1,5 +1,6 @@
 # Config with credentials
 .spa_config.json
+.env
 
 # Python
 __pycache__/

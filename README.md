@@ -25,7 +25,7 @@ The app has a "Share Device" feature that generates a QR code. This tool:
 
 ```bash
 # Install
-git clone https://github.com/yourusername/bestway-spa-v2.git
+git clone https://github.com/epheterson/bestway-spa-v2.git
 cd bestway-spa-v2
 pip install -r requirements.txt
 
@@ -109,6 +109,12 @@ Config is stored in `.spa_config.json` (gitignored). Override the path with the 
   "product_series": "ULTRAFIT AIRJET"
 }
 ```
+
+## Security notes
+
+- **SSL verification** is disabled (`verify=False`) because the Bestway API servers use certificates that fail validation in some environments. Traffic is still TLS-encrypted; only certificate chain verification is skipped. This matches the official Android app's behavior.
+- **APPID/APPSECRET** are extracted from the publicly downloadable Bestway SmartSpa APK and are identical for all users. They are not personal credentials.
+- **Your credentials** (`visitor_id`, `device_id`) are stored locally in `.spa_config.json` (gitignored). Never commit this file.
 
 ## Compatible devices
 
