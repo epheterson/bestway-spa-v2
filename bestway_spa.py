@@ -149,6 +149,85 @@ class BestwayAPI:
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
+
+# --- New gateway (post-2026-07 migration) ------------------------------------
+# Bestway moved V02 spas off smarthub onto a Gizwits AEP gateway. Same device and
+# same datapoint names; only the transport changed. Protocol notes:
+# ~/vault/infra/hottub/SETUP.md and cdpuk/ha-bestway#135.
+NEW_GW_HOSTS = {
+    "EU": "https://smart-spa-eu-app.bestwaycorp.com",
+    "US": "https://smart-spa-us-app.bestwaycorp.com",
+    "CN": "https://smart-spa-cn-app.bestwaycorp.com",
+}
+NEW_GW_APP_ID = "39ef26ff404a4cb1b5652f336d4bc045"
+
+
+class NewGatewayAPI:
+    """Client for the post-migration Bestway gateway."""
+
+    def __init__(self, host: str, token: str | None = None):
+        self.base_url = host.rstrip("/")
+        self.token = token
+
+    @staticmethod
+    def _md5_b64(body: str) -> str:
+        return base64.b64encode(hashlib.md5(body.encode()).digest()).decode()
+
+    def _request(self, path: str, body_obj: dict | None = None, method: str = "POST") -> dict:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        body = json.dumps(body_obj, separators=(",", ":")) if body_obj is not None else None
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json; charset=utf-8",
+            "Version": "1.0",
+            "date": "null",
+            "X-Gizwits-Application-Id": NEW_GW_APP_ID,
+            "User-Agent": "gizwitssuperapprn",
+        }
+        if body:
+            headers["Content-MD5"] = self._md5_b64(body)
+        if self.token:
+            headers["Authorization"] = self.token
+        resp = requests.request(method, url, headers=headers, data=body, timeout=15)
+        resp.raise_for_status()
+        out = resp.json()
+        if out.get("error"):
+            raise RuntimeError(f"{out.get('code')}: {out.get('message')}")
+        return out
+
+    def login(self, account: str, password: str) -> dict:
+        """Account login -> token payload. The envelope's `data` is an OBJECT here."""
+        out = self._request("app/smart_home/login/pwd", {
+            "appKey": NEW_GW_APP_ID,
+            "data": {"account": account, "password": password,
+                     "lang": "en", "refreshToken": True},
+            "version": "1.0",
+        })
+        return out.get("data") or {}
+
+    def devices(self) -> list[dict]:
+        return self._request("app/smart_home/users/devices", method="GET").get("data") or []
+
+    def shadow(self, product_key: str, mac: str) -> dict:
+        return self._request(
+            f"app/device/shadow/{product_key}/{mac.lower()}", method="GET"
+        ).get("data") or {}
+
+    def control(self, product_key: str, mac: str, datapoints: dict) -> dict:
+        """Write datapoints.
+
+        `data` must be a JSON *string* here — passing an object returns
+        200/data:true and silently does nothing. Write 1/0; filter_state and
+        heater_state read back as 2 while running, so never round-trip compare
+        against the value you wrote.
+        """
+        return self._request(f"app/device/control/{product_key}/{mac.lower()}", {
+            "appKey": NEW_GW_APP_ID,
+            "data": json.dumps(datapoints, separators=(",", ":")),
+            "version": "1.0",
+        })
+
+
 def config_path() -> Path:
     import os
     return Path(os.environ.get("BESTWAY_CONFIG", DEFAULT_CONFIG))
@@ -282,8 +361,16 @@ def discover_devices(api: BestwayAPI, token: str) -> list[dict]:
 
 # ── Device State ─────────────────────────────────────────────────────────────
 
-def read_state(api: BestwayAPI, token: str, device_id: str, product_id: str) -> dict | None:
-    """Read device shadow (thing_shadow). Returns reported state dict or None."""
+def read_state(api, token: str, device_id: str, product_id: str, mac: str | None = None) -> dict | None:
+    """Read device shadow. Returns reported state dict or None."""
+    if isinstance(api, NewGatewayAPI):
+        state = api.shadow(product_id, mac or "")
+        if state:
+            # The gateway reports connectivity as ConnectType; the rest of the
+            # tool expects the legacy is_online flag.
+            state["is_online"] = state.get("ConnectType") == "online"
+        return state or None
+
     result = api.post("/api/device/thing_shadow/", {
         "device_id": device_id,
         "product_id": product_id,
@@ -339,14 +426,19 @@ def print_state(state: dict | None) -> None:
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 def send_command(
-    api: BestwayAPI, token: str, device_id: str, product_id: str,
-    key: str, value: int,
+    api, token: str, device_id: str, product_id: str,
+    key: str, value: int, mac: str | None = None,
 ) -> dict:
-    """Send a command, trying v2 (AES encrypted) then falling back to v1.
+    """Send a command.
+
+    New gateway: single control POST. Legacy: v2 (AES encrypted) then v1.
 
     v2 endpoint: /api/v2/device/command (encrypted payload)
     v1 endpoint: /api/device/command/ (plaintext, may be deprecated)
     """
+    if isinstance(api, NewGatewayAPI):
+        return api.control(product_id, mac or "", {key: value})
+
     shadow = {"state": {"desired": {key: value}}}
     desired_json = json.dumps(shadow, separators=(",", ":"))
 
@@ -375,21 +467,23 @@ def send_command(
 
 
 def send_and_verify(
-    api: BestwayAPI, token: str, device_id: str, product_id: str,
-    key: str, value: int, label: str,
+    api, token: str, device_id: str, product_id: str,
+    key: str, value: int, label: str, mac: str | None = None,
 ) -> None:
     """Send command, wait, read back state to confirm."""
-    result = send_command(api, token, device_id, product_id, key, value)
+    result = send_command(api, token, device_id, product_id, key, value, mac)
     code = result.get("code", "?")
-    if code != 0:
+    # Legacy returns 0; the new gateway returns "200".
+    if code not in (0, "200", 200):
         print(f"  {label}: API returned code={code} msg={result.get('message', '?')}")
         return
 
-    print(f"  {label}: command sent (code=0)")
+    print(f"  {label}: command sent")
 
-    # Read-back verification
+    # Read-back verification. NOTE: filter_state/heater_state read back as 2
+    # while running even though you write 1 — don't compare to the written value.
     time.sleep(READBACK_DELAY)
-    state = read_state(api, token, device_id, product_id)
+    state = read_state(api, token, device_id, product_id, mac)
     if state:
         actual = state.get(key, "?")
         print(f"  Verified: {key}={actual}")
@@ -488,7 +582,7 @@ def setup(region: str | None = None) -> None:
 
     # Verify
     print("\n  Verifying connection...")
-    state = read_state(api, token, cfg["device_id"], cfg["product_id"])
+    state = read_state(api, token, cfg["device_id"], cfg["product_id"], cfg.get("mac"))
     if state and state.get("water_temperature") is not None:
         print_state(state)
         print("  Setup complete!")
@@ -509,6 +603,22 @@ def get_api_and_token() -> tuple[BestwayAPI, str, dict]:
         sys.exit(1)
 
     region = cfg.get("region", "EU")
+
+    # Post-migration gateway (default for anything set up after 2026-07).
+    if cfg.get("gateway", "new" if cfg.get("token") else "legacy") == "new":
+        host = NEW_GW_HOSTS.get(region, NEW_GW_HOSTS["US"])
+        token = cfg.get("token")
+        if not token:
+            print("No token. Run: bestway_spa.py login")
+            sys.exit(1)
+        api = NewGatewayAPI(host, token)
+        try:
+            api.devices()  # cheap probe: proves the token is still good
+        except Exception as ex:
+            print(f"Token rejected ({ex}). Run: bestway_spa.py login")
+            sys.exit(1)
+        return api, token, cfg
+
     if region not in API_HOSTS:
         print(f"Invalid region '{region}' in config. Run: bestway_spa.py setup")
         sys.exit(1)
@@ -519,6 +629,53 @@ def get_api_and_token() -> tuple[BestwayAPI, str, dict]:
         sys.exit(1)
 
     return api, token, cfg
+
+
+def login(region: str | None = None) -> None:
+    """Account login against the new gateway; stores the token (never the password)."""
+    import getpass
+
+    cfg = load_config() or {}
+    region = (region or cfg.get("region") or "US").upper()
+    if region not in NEW_GW_HOSTS:
+        print(f"Region must be one of {', '.join(NEW_GW_HOSTS)}")
+        sys.exit(1)
+
+    account = input("Bestway account email: ").strip()
+    password = getpass.getpass("Password (not stored): ")
+
+    api = NewGatewayAPI(NEW_GW_HOSTS[region])
+    try:
+        data = api.login(account, password)
+    except Exception as ex:
+        print(f"Login failed: {ex}")
+        sys.exit(1)
+
+    token = data.get("userToken")
+    if not token:
+        print("Login returned no token.")
+        sys.exit(1)
+    api.token = token
+
+    devices = api.devices()
+    if not devices:
+        print("Logged in, but no devices on the account.")
+        sys.exit(1)
+    dev = devices[0]
+
+    cfg.update({
+        "gateway": "new",
+        "region": region,
+        "account": account,
+        "token": token,
+        "refresh_token": data.get("refresh_token") or data.get("refreshToken"),
+        "product_id": dev.get("productKey"),
+        "mac": (dev.get("mac") or "").lower(),
+        "device_name": dev.get("name"),
+    })
+    cfg.setdefault("device_id", dev.get("did") or dev.get("sno"))
+    save_config(cfg)
+    print(f"Logged in. Token saved for {dev.get('name')} ({dev.get('productKey')}/{cfg['mac']}).")
 
 
 def main() -> None:
@@ -536,9 +693,13 @@ def main() -> None:
         setup(region=arg.upper() if arg else None)
         return
 
+    if cmd == "login":
+        login(region=arg.upper() if arg else None)
+        return
+
     if cmd == "status":
         api, token, cfg = get_api_and_token()
-        state = read_state(api, token, cfg["device_id"], cfg["product_id"])
+        state = read_state(api, token, cfg["device_id"], cfg["product_id"], cfg.get("mac"))
         print_state(state)
         return
 
@@ -605,7 +766,7 @@ def main() -> None:
 
     if cmd not in commands:
         print(f"Unknown command: {cmd}")
-        print("Commands: setup, status, heat, temp, filter, jets, hydrojet, power, raw, debug")
+        print("Commands: login, setup, status, heat, temp, filter, jets, hydrojet, power, raw, debug")
         sys.exit(1)
 
     if arg is None:
@@ -615,7 +776,7 @@ def main() -> None:
     key, parse = commands[cmd]
     value = parse(arg)
     label = f"{cmd} {'on' if value else 'off'}" if key != "temperature_setting" else f"temp {value}"
-    send_and_verify(api, token, did, pid, key, value, label)
+    send_and_verify(api, token, did, pid, key, value, label, cfg.get("mac"))
 
 
 if __name__ == "__main__":
