@@ -1,0 +1,29 @@
+# Weekly version updates, grouped so a quiet week is one pull request per ecosystem.
+# Security updates are separate and come as soon as an advisory lands.
+# Quiet mode (Eric, 2026-10-06: "can the checks be silent if nothing"):
+# routine version-update PRs are off (limit 0). Dependabot still opens a PR
+# only when a security advisory affects a dependency here.
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    open-pull-requests-limit: 0  # quiet: no routine version PRs; security updates still open
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+    groups:
+      python-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    open-pull-requests-limit: 0  # quiet: no routine version PRs; security updates still open
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+    groups:
+      actions:
+        patterns: ["*"]

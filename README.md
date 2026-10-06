@@ -1,5 +1,7 @@
 # bestway-spa-v2
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/epheterson/bestway-spa-v2/badge)](https://scorecard.dev/viewer/?uri=github.com/epheterson/bestway-spa-v2)
+
 Control Bestway SmartSpa / Lay-Z-Spa hot tubs (V02) from the command line.
 
 **No MITM proxy. No dedicated phone. No Charles Proxy.** Just scan a QR code from the app and you're in.
