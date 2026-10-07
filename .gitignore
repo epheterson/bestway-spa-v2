@@ -1,5 +1,5 @@
 # Config with credentials
-.spa_config.json
+.spa_config.json*
 .env
 
 # Python
